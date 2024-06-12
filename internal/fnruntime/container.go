@@ -23,7 +23,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -51,12 +54,15 @@ const (
 	dockerBin  string = "docker"
 	podmanBin  string = "podman"
 	nerdctlBin string = "nerdctl"
+	kubectlBin string = "kubectl"
 
 	ContainerRuntimeEnv = "KPT_FN_RUNTIME"
+	KubeconfigEnv       = "KUBECONFIG"
 
-	Docker  ContainerRuntime = "docker"
-	Podman  ContainerRuntime = "podman"
-	Nerdctl ContainerRuntime = "nerdctl"
+	Docker     ContainerRuntime = "docker"
+	Podman     ContainerRuntime = "podman"
+	Nerdctl    ContainerRuntime = "nerdctl"
+	Kubernetes ContainerRuntime = "kubernetes"
 )
 
 type ContainerRuntime string
@@ -101,6 +107,8 @@ func (r ContainerRuntime) GetBin() string {
 		return podmanBin
 	case Nerdctl:
 		return nerdctlBin
+	case Kubernetes:
+		return kubectlBin
 	default:
 		return dockerBin
 	}
@@ -128,6 +136,8 @@ func (f *ContainerFn) Run(reader io.Reader, writer io.Writer) error {
 		return f.runCLI(reader, writer, podmanBin, filterPodmanCLIOutput)
 	case Nerdctl:
 		return f.runCLI(reader, writer, nerdctlBin, filterNerdctlCLIOutput)
+	case Kubernetes:
+		return f.runCLI(reader, writer, kubectlBin, filterDockerCLIOutput)
 	default:
 		return f.runCLI(reader, writer, dockerBin, filterDockerCLIOutput)
 	}
@@ -135,7 +145,13 @@ func (f *ContainerFn) Run(reader io.Reader, writer io.Writer) error {
 
 func (f *ContainerFn) runCLI(reader io.Reader, writer io.Writer, bin string, filterCLIOutputFn func(io.Reader) string) error {
 	errSink := bytes.Buffer{}
-	cmd, cancel := f.getCmd(bin)
+	var cmd *exec.Cmd
+	var cancel context.CancelFunc
+	if bin == kubectlBin {
+		cmd, cancel = f.getKubectlCmd(bin)
+	} else {
+		cmd, cancel = f.getCmd(bin)
+	}
 	defer cancel()
 	cmd.Stdin = reader
 	cmd.Stdout = writer
@@ -204,6 +220,50 @@ func (f *ContainerFn) getCmd(binName string) (*exec.Cmd, context.CancelFunc) {
 	return exec.CommandContext(ctx, binName, args...), cancel
 }
 
+// getKubectlCmd assembles a command for kubectl. The input binName
+// is expected to be "kubectl".
+func (f *ContainerFn) getKubectlCmd(binName string) (*exec.Cmd, context.CancelFunc) {
+	podName := strings.Split(path.Base(f.Image), ":")[0]
+	args := []string{
+		"run", "--rm", "-i",
+		podName,
+		"--attach",
+		"--quiet",
+		"--restart=Never",
+	}
+	if f.UIDGID != "" {
+		args = append(args, "--overrides", fmt.Sprintf("{\"spec\":{\"securityContext\":{\"runAsUser\":%s,\"runAsGroup\":%s}}}", f.UIDGID, f.UIDGID))
+	} else {
+		args = append(args, "--overrides", "{\"spec\":{\"securityContext\":{\"runAsUser\":65534,\"runAsGroup\":65534}}}")
+
+	}
+	if f.Perm.AllowNetwork {
+		args = append(args, "--overrides={\"spec\":{\"hostNetwork\":true}}")
+	}
+	switch f.ImagePullPolicy {
+	case NeverPull:
+		args = append(args, "--image-pull-policy=Never")
+	case AlwaysPull:
+		args = append(args, "--image-pull-policy=Always")
+	case IfNotPresentPull:
+		args = append(args, "--image-pull-policy=IfNotPresent")
+	default:
+		args = append(args, "--image-pull-policy=IfNotPresent")
+	}
+	containerEnv := NewContainerEnvFromStringSlice(f.Env)
+	kubectlFlags := GetKubectlFlags(containerEnv)
+	args = append(args, kubectlFlags...)
+	args = append(args, "--image", f.Image)
+	timeout := defaultLongTimeout
+	if f.Timeout != 0 {
+		timeout = f.Timeout
+	}
+	args = append(args, "--pod-running-timeout", timeout.String())
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return exec.CommandContext(ctx, binName, args...), cancel
+}
+
 // NewContainerEnvFromStringSlice returns a new ContainerEnv pointer with parsing
 // input envStr. envStr example: ["foo=bar", "baz"]
 // using this instead of runtimeutil.NewContainerEnvFromStringSlice() to avoid
@@ -222,6 +282,31 @@ func NewContainerEnvFromStringSlice(envStr []string) *runtimeutil.ContainerEnv {
 		}
 	}
 	return ce
+}
+
+// GetKubectlFlags returns the kubectl flags for the container env.
+func GetKubectlFlags(ce *runtimeutil.ContainerEnv) []string {
+	envs := ce.EnvVars
+	if envs == nil {
+		envs = make(map[string]string)
+	}
+
+	flags := []string{}
+	// return in order to keep consistent among different runs
+	keys := []string{}
+	for k := range envs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		flags = append(flags, "--env", key+"="+envs[key])
+	}
+
+	for _, key := range ce.VarsToExport {
+		flags = append(flags, "--env", key)
+	}
+
+	return flags
 }
 
 // ResolveToImageForCLI converts the function short path to the full image url.
@@ -382,10 +467,12 @@ func StringToContainerRuntime(v string) (ContainerRuntime, error) {
 		return Podman, nil
 	case string(Nerdctl):
 		return Nerdctl, nil
+	case string(Kubernetes):
+		return Kubernetes, nil
 	case "":
 		return Docker, nil
 	default:
-		return "", fmt.Errorf("unsupported runtime: %q the runtime must be either %s or %s", v, Docker, Podman)
+		return "", fmt.Errorf("unsupported runtime: %q the runtime must be either %s, %s or %s", v, Docker, Podman, Kubernetes)
 	}
 }
 
@@ -397,6 +484,8 @@ func ContainerRuntimeAvailable(runtime ContainerRuntime) error {
 		return podmanCmdAvailable()
 	case Nerdctl:
 		return nerdctlCmdAvailable()
+	case Kubernetes:
+		return kubectlCmdAvailable()
 	default:
 		return dockerCmdAvailable()
 	}
@@ -465,5 +554,33 @@ To install nerdctl, follow the instructions at https://github.com/containerd/ner
 	if err != nil {
 		return fmt.Errorf("%v\n%s", err, suggestedText)
 	}
+	return nil
+}
+
+func kubectlCmdAvailable() error {
+	suggestedText := `kubectl must be installed.
+To install kubectl, follow the instructions at https://kubernetes.io/docs/tasks/tools/.
+`
+	kubeconfig := os.Getenv(KubeconfigEnv)
+	if kubeconfig == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("cannot find home directory: %v", err)
+		}
+		kubeconfig = filepath.Join(home, ".kube", "config")
+	}
+
+	if _, err := os.Stat(kubeconfig); os.IsNotExist(err) {
+		return fmt.Errorf("kubeconfig not found at %s", kubeconfig)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), versionCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, kubectlBin, "version", "--client")
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Errorf("error running kubectl: %v\n%s", err, suggestedText)
+	}
+
 	return nil
 }
